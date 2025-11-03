@@ -1658,6 +1658,9 @@ def training_log(
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
             report_memory_flag = False
+        else:
+            # Report memory at every log interval
+            report_memory(f'(after {iteration} iterations)')
         # Write timers to wandb, don't reset the counts
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
