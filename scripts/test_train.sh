@@ -5,8 +5,8 @@
 #SBATCH --ntasks-per-node=1       # 每节点任务数（保持 1 即可）
 #SBATCH --gpus-per-node=4         # 每节点 GPU 数量（GPUS_PER_NODE）
 #SBATCH -t 48:00:00               # 最长运行时间（根据需要修改）
-#SBATCH -o logs/%x_%j.out         # 标准输出日志
-#SBATCH -e logs/%x_%j.err         # 错误日志
+#SBATCH -o /data/home/scyb226/lzx/Megatron-LM/scripts/logs/%x_%j.out         # 标准输出日志
+#SBATCH -e /data/home/scyb226/lzx/Megatron-LM/scripts/logs/%x_%j.err         # 错误日志
 
 unset LD_LIBRARY_PATH
 module load cuda/12.4
