@@ -939,6 +939,32 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     #               the amax_history back.
     # After TE2.x: Below function is an empty function and does nothing.
     correct_amax_history_if_needed(model)
+    
+    # ========== Tensor Offload: 初始化offload manager ==========
+    # 在模型准备好之后，初始化tensor offload manager
+    if hasattr(args, 'enable_tensor_offload') and args.enable_tensor_offload:
+        from megatron.core.tensor_offload import initialize_offload_manager
+        offload_manager = initialize_offload_manager(
+            enabled=True,
+            pin_memory=getattr(args, 'tensor_offload_pin_memory', True),
+            num_prefetch_layers=getattr(args, 'tensor_offload_num_prefetch_layers', 1),
+            release_after_fwd=getattr(args, 'tensor_offload_release_after_fwd', False),
+            bucket_mb=getattr(args, 'tensor_offload_bucket_mb', 0),
+        )
+        print_rank_0("=" * 60)
+        print_rank_0("Tensor Offload Manager initialized!")
+        print_rank_0(f"  Pin memory: {args.tensor_offload_pin_memory}")
+        print_rank_0(f"  Num prefetch layers: {args.tensor_offload_num_prefetch_layers}")
+        print_rank_0(f"  Release after forward: {getattr(args, 'tensor_offload_release_after_fwd', False)}")
+        print_rank_0(f"  Bucket size (MB): {getattr(args, 'tensor_offload_bucket_mb', 0)}")
+        print_rank_0("=" * 60)
+        
+        # 执行初始offload：将所有层的参数offload到CPU以释放GPU内存
+        # 这应该在所有层都注册完成后执行（模型初始化完成后）
+        print_rank_0("Performing initial offload of model parameters to CPU...")
+        offload_manager.initial_offload_all_layers()
+        print_rank_0("Initial offload completed!")
+    # ============================================================
 
     if wrap_with_ddp:
         if args.use_torch_fsdp2:
@@ -2495,6 +2521,13 @@ def train(
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6} MJ")
         energy_monitor.shutdown()
 
+    # ========== Tensor Offload: 打印统计信息 ==========
+    from megatron.core.tensor_offload import get_offload_manager
+    offload_manager = get_offload_manager()
+    if offload_manager is not None:
+        offload_manager.print_stats()
+    # ===================================================
+    
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
         wandb_writer = get_wandb_writer()

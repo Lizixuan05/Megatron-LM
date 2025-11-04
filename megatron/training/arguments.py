@@ -3252,6 +3252,25 @@ def _add_experimental_args(parser):
 
     group.add_argument('--enable-experimental', action='store_true',
                        help='Enable experimental features.')
+    
+    # Tensor Offload 相关参数
+    group.add_argument('--enable-tensor-offload', action='store_true',
+                       help='Enable tensor offload to CPU to reduce GPU memory usage. '
+                            'This will offload layer parameters to CPU when not in use.')
+    group.add_argument('--tensor-offload-pin-memory', action='store_true', default=True,
+                       help='Use pinned memory for tensor offload to speed up CPU-GPU transfers.')
+    group.add_argument('--no-tensor-offload-pin-memory', dest='tensor_offload_pin_memory', action='store_false',
+                       help='Disable pinned memory for tensor offload.')
+    group.add_argument('--tensor-offload-num-prefetch-layers', type=int, default=1,
+                       help='Number of layers to prefetch in advance. Higher values can '
+                            'hide transfer latency but use more memory.')
+    group.add_argument('--tensor-offload-release-after-fwd', action='store_true', default=False,
+                       help='If True, immediately offload parameters to CPU after forward pass. '
+                            'Parameters will be JIT prefetched before backward pass. '
+                            'This minimizes peak GPU memory but increases PCIe bandwidth usage.')
+    group.add_argument('--tensor-offload-bucket-mb', type=int, default=0,
+                       help='Reserved bucket size (MB) for future bucket-based implementation. '
+                            'Currently unused, reserved for parameter flattening and bucket transfer optimization.')
     group.add_argument('--spec', type=str, default=None, nargs='*',
                        help='Specify the <module_location function_name> pair '
                        'that returns a spec to customize a model, transformer '

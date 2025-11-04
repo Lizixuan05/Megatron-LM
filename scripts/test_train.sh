@@ -127,5 +127,7 @@ torchrun --nproc_per_node=${NUM_PROC} "${MEGATRON_ROOT}/pretrain_gpt.py" \
   --eval-iters ${EVAL_ITERS} \
   --log-throughput \
   --log-memory-to-tensorboard \
+  --enable-tensor-offload \
+  --tensor-offload-num-prefetch-layers 2 \
   --bf16
 

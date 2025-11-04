@@ -405,6 +405,34 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
+        
+        # ========== Tensor Offload: 注册layer到offload manager ==========
+        from megatron.core.tensor_offload import get_offload_manager
+        offload_manager = get_offload_manager()
+        if offload_manager is not None:
+            offload_manager.register_layer(self.layer_number, self)
+            
+            # 注册模块级 backward hooks（一次性注册，避免每次forward重复注册）
+            # 注意：在hook内部重新获取offload_manager，因为它可能在后续被重新初始化
+            layer_id = self.layer_number  # 保存layer_id，避免闭包问题
+            
+            # BWD-前：取回权重（如果FWD后已释放）
+            def backward_pre_hook(mod, grad_output):
+                from megatron.core.tensor_offload import get_offload_manager
+                off_mgr = get_offload_manager()
+                if off_mgr is not None:
+                    off_mgr.on_backward_pre_hook(layer_id)
+            
+            # BWD-后：回写权重
+            def backward_post_hook(mod, grad_input, grad_output):
+                from megatron.core.tensor_offload import get_offload_manager
+                off_mgr = get_offload_manager()
+                if off_mgr is not None:
+                    off_mgr.on_backward_post_hook(layer_id)
+            
+            self._bwd_pre_handle = self.register_full_backward_pre_hook(backward_pre_hook)
+            self._bwd_post_handle = self.register_full_backward_hook(backward_post_hook)
+        # ================================================================
 
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):
@@ -427,12 +455,28 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        # ========== Tensor Offload: Pre-forward Hook ==========
+        # 在forward前确保参数已经加载到GPU
+        from megatron.core.tensor_offload import get_offload_manager
+        offload_manager = get_offload_manager()
+        if offload_manager is not None:
+            offload_manager.on_forward_pre_hook(self.layer_number)
+        # =====================================================
+        
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        
+        # ========== Tensor Offload: Post-forward Hook ==========
+        # forward完成后的处理
+        if offload_manager is not None:
+            offload_manager.on_forward_post_hook(self.layer_number)
+            # 注意：backward hooks 已在 __init__ 中注册为模块级 hooks
+        # ======================================================
+        
         return output, context
 
     def _forward_attention(
