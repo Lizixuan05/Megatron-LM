@@ -1251,7 +1251,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
     kw_args['layernorm_epsilon'] = args.norm_epsilon
-    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['deallocate_pipeline_outputs'] = False  # Changed to False to fix tensor offload compatibility
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
@@ -3271,6 +3271,9 @@ def _add_experimental_args(parser):
     group.add_argument('--tensor-offload-bucket-mb', type=int, default=0,
                        help='Reserved bucket size (MB) for future bucket-based implementation. '
                             'Currently unused, reserved for parameter flattening and bucket transfer optimization.')
+    group.add_argument('--tensor-offload-optimizer-states', action='store_true', default=False,
+                       help='If True, also offload optimizer states (e.g., momentum, variance) to CPU. '
+                            'This can further reduce GPU memory usage but may impact training speed.')
     group.add_argument('--spec', type=str, default=None, nargs='*',
                        help='Specify the <module_location function_name> pair '
                        'that returns a spec to customize a model, transformer '

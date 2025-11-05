@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH -J megatron_test          # 作业名
+#SBATCH -J test          # 作业名
 #SBATCH -p gpu                    # 分区名称（根据集群情况修改）
 #SBATCH -N 1                      # 节点数（NNODES）
 #SBATCH --ntasks-per-node=1       # 每节点任务数（保持 1 即可）
 #SBATCH --gpus-per-node=4         # 每节点 GPU 数量（GPUS_PER_NODE）
-#SBATCH -t 48:00:00               # 最长运行时间（根据需要修改）
+#SBATCH -t 4:00:00               # 最长运行时间（根据需要修改）
 #SBATCH -o /data/home/scyb226/lzx/Megatron-LM/scripts/logs/%x_%j.out         # 标准输出日志
 #SBATCH -e /data/home/scyb226/lzx/Megatron-LM/scripts/logs/%x_%j.err         # 错误日志
 
@@ -29,8 +29,8 @@ export PYTHONPATH="/data/home/scyb226/lzx/Megatron-LM:$PYTHONPATH"
 echo $LD_LIBRARY_PATH
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export CUDA_LAUNCH_BLOCKING=1
-export NCCL_DEBUG=INFO                                                                                                                                        
+#export CUDA_LAUNCH_BLOCKING=1
+#export NCCL_DEBUG=INFO                                                                                                                                        
                                                                           
 export NCCL_IB_DISABLE=0                                                                                                                                      
 export NCCL_IB_HCA=mlx5_0:1,mlx5_1:1,mlx5_3:1,mlx5_4:1                                                                                                        
@@ -89,7 +89,7 @@ if [ ! -f "${MEGATRON_ROOT}/pretrain_gpt.py" ]; then
 fi
 echo "pretrain_gpt.py found: YES"
 
-torchrun --nproc_per_node=${NUM_PROC} "${MEGATRON_ROOT}/pretrain_gpt.py" \
+torchrun --nproc_per_node=${NUM_PROC} --master_port=29501 "${MEGATRON_ROOT}/pretrain_gpt.py" \
   --data-path ${DATA_PATH} \
   --split ${SPLIT} \
   --num-layers ${NUM_LAYERS} \
@@ -128,6 +128,9 @@ torchrun --nproc_per_node=${NUM_PROC} "${MEGATRON_ROOT}/pretrain_gpt.py" \
   --log-throughput \
   --log-memory-to-tensorboard \
   --enable-tensor-offload \
+  --tensor-offload-optimizer-states \
+  --tensor-offload-pin-memory \
   --tensor-offload-num-prefetch-layers 2 \
   --bf16
+#   --tensor-offload-release-after-fwd
 

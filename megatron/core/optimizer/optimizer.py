@@ -663,8 +663,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 for i, param in enumerate(param_group['params']):
                     if param.requires_grad:
 
-                        # float16 params:
-                        if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                        # float16 params (支持CUDA和CPU张量，后者用于tensor offload)
+                        # Support both CUDA and CPU tensors (CPU tensors for tensor offload)
+                        if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor',
+                                           'torch.HalfTensor', 'torch.BFloat16Tensor']:
                             float16_params_this_group.append(param)
                             # Create a copy
                             main_param = param.detach().clone().float()
@@ -682,17 +684,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Reset existing state dict key to the new main param.
                             if param in self.optimizer.state:
                                 self.optimizer.state[main_param] = self.optimizer.state.pop(param)
-                        # fp32 params.
-                        elif param.type() == 'torch.cuda.FloatTensor':
+                        # fp32 params (支持CUDA和CPU张量)
+                        # Support both CUDA and CPU tensors
+                        elif param.type() in ['torch.cuda.FloatTensor', 'torch.FloatTensor']:
                             fp32_params_this_group.append(param)
                             param_group['params'][i] = param
 
                         else:
                             raise TypeError(
                                 'Wrapped parameters must be one of '
-                                'torch.cuda.FloatTensor,  '
-                                'torch.cuda.HalfTensor, or '
-                                'torch.cuda.BFloat16Tensor. '
+                                'torch.cuda.FloatTensor, torch.cuda.HalfTensor, torch.cuda.BFloat16Tensor, '
+                                'torch.FloatTensor, torch.HalfTensor, or torch.BFloat16Tensor. '
                                 'Received {}'.format(param.type())
                             )
 

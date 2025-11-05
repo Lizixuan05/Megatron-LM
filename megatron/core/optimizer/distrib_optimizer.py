@@ -354,8 +354,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]
                 param_range = gbuf_range["param_map"][model_param]["param"]
 
-                # fp16, bf16 params.
-                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                # fp16, bf16 params (支持CUDA和CPU张量，后者用于tensor offload)
+                # Support both CUDA and CPU tensors (CPU tensors for tensor offload)
+                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor',
+                                         'torch.HalfTensor', 'torch.BFloat16Tensor']:
 
                     # Generate sharded model param.
                     if is_float8tensor(model_param) and config.fp8_recipe != "delayed":
@@ -413,8 +415,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_float16_params_this_group.append(shard_model_param)
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
-                # fp32 params.
-                elif model_param.type() == 'torch.cuda.FloatTensor':
+                # fp32 params (支持CUDA和CPU张量)
+                # Support both CUDA and CPU tensors
+                elif model_param.type() in ['torch.cuda.FloatTensor', 'torch.FloatTensor']:
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
@@ -427,9 +430,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 else:
                     raise TypeError(
                         'Wrapped parameters must be one of '
-                        'torch.cuda.FloatTensor,  '
-                        'torch.cuda.HalfTensor, or '
-                        'torch.cuda.BFloat16Tensor. '
+                        'torch.cuda.FloatTensor, torch.cuda.HalfTensor, torch.cuda.BFloat16Tensor, '
+                        'torch.FloatTensor, torch.HalfTensor, or torch.BFloat16Tensor. '
                         'Received {}'.format(model_param.type())
                     )
 
@@ -575,8 +577,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # For all the parameters in this group.
             for param in param_group['params']:
                 if param.requires_grad:
-                    # fp32 copy only needed for 16-bit parameters.
-                    if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                    # fp32 copy only needed for 16-bit parameters (支持CUDA和CPU张量)
+                    # Support both CUDA and CPU tensors (CPU tensors for tensor offload)
+                    if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor',
+                                       'torch.HalfTensor', 'torch.BFloat16Tensor']:
                         param.main_param = None
                         param.main_param_sharded = True
 

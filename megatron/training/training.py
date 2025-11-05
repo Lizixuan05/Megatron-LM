@@ -855,6 +855,31 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args = get_args()
     args.model_type = model_type
 
+    # ========== Tensor Offload: 初始化offload manager（必须在模型构建之前！） ==========
+    # 注意：必须在模型初始化之前初始化offload manager，这样层才能在__init__时注册自己
+    if hasattr(args, 'enable_tensor_offload') and args.enable_tensor_offload:
+        from megatron.core.tensor_offload import initialize_offload_manager, get_offload_manager
+        
+        # 检查是否已经初始化过了（避免重复初始化）
+        if get_offload_manager() is None:
+            offload_manager = initialize_offload_manager(
+                enabled=True,
+                offload_optimizer_states=getattr(args, 'tensor_offload_optimizer_states', False),
+                pin_memory=getattr(args, 'tensor_offload_pin_memory', True),
+                num_prefetch_layers=getattr(args, 'tensor_offload_num_prefetch_layers', 1),
+                release_after_fwd=getattr(args, 'tensor_offload_release_after_fwd', False),
+                bucket_mb=getattr(args, 'tensor_offload_bucket_mb', 0),
+            )
+            print_rank_0("=" * 60)
+            print_rank_0("Tensor Offload Manager initialized (BEFORE model creation)!")
+            print_rank_0(f"  Offload optimizer states: {getattr(args, 'tensor_offload_optimizer_states', False)}")
+            print_rank_0(f"  Pin memory: {getattr(args, 'tensor_offload_pin_memory', True)}")
+            print_rank_0(f"  Num prefetch layers: {getattr(args, 'tensor_offload_num_prefetch_layers', 1)}")
+            print_rank_0(f"  Release after forward: {getattr(args, 'tensor_offload_release_after_fwd', False)}")
+            print_rank_0(f"  Bucket size (MB): {getattr(args, 'tensor_offload_bucket_mb', 0)}")
+            print_rank_0("=" * 60)
+    # ============================================================
+
     # Build model.
     def build_model():
         if (
@@ -940,31 +965,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # After TE2.x: Below function is an empty function and does nothing.
     correct_amax_history_if_needed(model)
     
-    # ========== Tensor Offload: 初始化offload manager ==========
-    # 在模型准备好之后，初始化tensor offload manager
-    if hasattr(args, 'enable_tensor_offload') and args.enable_tensor_offload:
-        from megatron.core.tensor_offload import initialize_offload_manager
-        offload_manager = initialize_offload_manager(
-            enabled=True,
-            pin_memory=getattr(args, 'tensor_offload_pin_memory', True),
-            num_prefetch_layers=getattr(args, 'tensor_offload_num_prefetch_layers', 1),
-            release_after_fwd=getattr(args, 'tensor_offload_release_after_fwd', False),
-            bucket_mb=getattr(args, 'tensor_offload_bucket_mb', 0),
-        )
-        print_rank_0("=" * 60)
-        print_rank_0("Tensor Offload Manager initialized!")
-        print_rank_0(f"  Pin memory: {args.tensor_offload_pin_memory}")
-        print_rank_0(f"  Num prefetch layers: {args.tensor_offload_num_prefetch_layers}")
-        print_rank_0(f"  Release after forward: {getattr(args, 'tensor_offload_release_after_fwd', False)}")
-        print_rank_0(f"  Bucket size (MB): {getattr(args, 'tensor_offload_bucket_mb', 0)}")
-        print_rank_0("=" * 60)
-        
-        # 执行初始offload：将所有层的参数offload到CPU以释放GPU内存
-        # 这应该在所有层都注册完成后执行（模型初始化完成后）
-        print_rank_0("Performing initial offload of model parameters to CPU...")
-        offload_manager.initial_offload_all_layers()
-        print_rank_0("Initial offload completed!")
-    # ============================================================
+    # ========== Tensor Offload: initial offload 已移至 setup_model_and_optimizer() 之后 ==========
+    # 注意：不能在这里执行 initial_offload，因为优化器还没有创建！
+    # main_param 是在优化器初始化时从 model_param clone 的，所以必须等优化器创建后再offload
+    # ========================================================================================
 
     if wrap_with_ddp:
         if args.use_torch_fsdp2:
@@ -1249,6 +1253,30 @@ def setup_model_and_optimizer(
         torch.distributed.barrier()
         exit()
 
+    # ========== Tensor Offload: 执行初始offload ==========
+    # 关键：必须在优化器创建之后执行！
+    # 因为 main_param (fp32) 是在优化器初始化时从 model_param clone 的
+    # 如果在优化器创建前 offload，main_param 会留在 GPU 上导致设备不匹配
+    if hasattr(args, 'enable_tensor_offload') and args.enable_tensor_offload:
+        from megatron.core.tensor_offload import get_offload_manager
+        offload_manager = get_offload_manager()
+        
+        if offload_manager is not None:
+            print_rank_0("=" * 60)
+            print_rank_0("Performing initial offload of model parameters to CPU...")
+            print_rank_0("(After optimizer creation - this ensures main_param is also offloaded)")
+            offload_manager.initial_offload_all_layers()
+            print_rank_0("Initial offload completed!")
+            
+            # 打印统计信息
+            stats = offload_manager.get_stats()
+            print_rank_0(f"  Total layers registered: {len(offload_manager.layer_params)}")
+            print_rank_0(f"  Total offloaded: {stats['total_offloaded_mb']:.2f} MB")
+            print_rank_0("=" * 60)
+        else:
+            print_rank_0("WARNING: Tensor offload was enabled but offload_manager is None!")
+    # ====================================================
+
     return model, optimizer, opt_param_scheduler
 
 
@@ -1318,9 +1346,25 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    # ========== Tensor Offload: Pre-optimizer Hook ==========
+    # 在optimizer.step()之前，确保所有参数都在GPU上
+    # 这对于Pipeline Parallel非常重要，因为某些层可能在forward后offload了
+    # 但它们的backward还没有执行（或saved_tensors_hooks的unpack还没触发）
+    from megatron.core.tensor_offload import get_offload_manager
+    offload_manager = get_offload_manager()
+    if offload_manager is not None:
+        offload_manager.on_optimizer_step_pre()
+    # =========================================================
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+
+    # ========== Tensor Offload: Post-optimizer Hook ==========
+    # 在optimizer.step()完成后，将参数offload到CPU以释放GPU内存
+    if offload_manager is not None:
+        offload_manager.on_optimizer_step_post()
+    # =========================================================
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks

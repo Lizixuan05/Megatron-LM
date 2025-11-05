@@ -164,7 +164,8 @@ def clip_grad_by_total_norm_fp32(
                 grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
         else:
             if param.grad is not None:
-                assert param.grad.type() == 'torch.cuda.FloatTensor'
+                # Support both CUDA and CPU tensors (CPU tensors for tensor offload)
+                assert param.grad.type() in ['torch.cuda.FloatTensor', 'torch.FloatTensor']
                 params.append(param)
                 grads.append(to_local_if_dtensor(param.grad).detach())
 
