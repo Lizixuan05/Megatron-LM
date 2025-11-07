@@ -1,671 +1,799 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
-"""
-Tensor Offload Manager for Megatron-LM
-======================================
-
-这个模块实现了一个简单但功能完整的tensor offload机制。
-主要目的是学习实践，展示如何在训练过程中管理GPU/CPU内存。
-
-核心思想：
-1. 在forward前将参数从CPU预取到GPU（使用独立的H2D stream和事件机制）
-2. 在forward后将参数offload回CPU（使用独立的D2H stream，可选FWD后立即释放策略）
-3. 使用异步操作和事件来隐藏传输延迟，避免全局同步阻塞
-4. 支持per-layer事件等待，实现精确的同步控制
-5. 支持FWD后立即释放策略，最小化峰值显存占用
-
-关键特性：
-- 双流机制：独立的H2D和D2H stream，实现真正的异步传输
-- 事件驱动：per-layer ready事件，计算流仅等待所需层的数据就绪
-- 可选FWD后释放：支持在FWD后立即offload，BWD前JIT预取的策略
-- 设备感知：记录每层的真实目标设备，支持PP/TP分片场景
-"""
-
 import logging
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 from collections import OrderedDict
 
-logger = logging.getLogger(__name__)
+# 在文件顶部其他 import 之后添加
+try:
+    from torch.utils.checkpoint import checkpoint as _ckpt
+except Exception:
+    _ckpt = None  # 没有就禁用重计算
 
+logger = logging.getLogger(__name__)
 
 class TensorOffloadManager:
     """
-    管理模型参数在CPU和GPU之间的offload。
-    
-    这是一个改进的实现，支持双流、事件机制和可选的FWD后释放策略。
-    
-    工作流程：
-    1. 注册需要管理的层（记录真实目标设备）
-    2. 在forward前调用prefetch将参数异步加载到GPU（使用H2D stream和事件）
-    3. 计算流通过wait_event等待层数据就绪，避免全局同步
-    4. 在forward后可选立即offload（release_after_fwd=True时）
-    5. 在backward前JIT预取（如果FWD后已释放）
-    6. 在backward后offload参数回CPU（使用D2H stream）
-    
-    注意：
-    - 使用torch.no_grad()保护所有搬运操作，避免污染计算图
-    - 优先使用事件机制而非全局synchronize()
-    - 支持PP/TP分片，每个rank只管理自己的层
+    Megatron-LM 按层参数 Offload 管理器（PP 友好）。
+    - PP 默认：BWD 后 offload，下一次用到前 JIT 预取。
+    - 双流 + 事件，严格保证 H2D/D2H 与计算流的拓扑顺序。
+    - 支持（可选）优化器状态 offload（教学/实验用途）。
     """
-    
+
     def __init__(
-        self, 
+        self,
         enabled: bool = True,
         offload_optimizer_states: bool = False,
         pin_memory: bool = True,
         num_prefetch_layers: int = 1,
         release_after_fwd: bool = False,
         bucket_mb: int = 0,
+        # [NEW] 更贴合 PP 的默认策略与性能/稳定性开关
+        pp_mode: bool = True,
+        copy_chunk_mb: int = 64,
+        include_buffers: bool = False,
+        offload_gradients: bool = True,  # 新增：梯度 offload
+        aggressive_release: bool = True,  # 新增：更积极的显存释放
+        recompute_enabled: bool = True,
+        recompute_policy: str = "auto",   # "always" 或 "auto"
+        recompute_min_params_mb: float = 64,  # auto 时的阈值（按层参数规模）
+        recompute_use_reentrant: Optional[bool] = False,  # PyTorch 2.x 建议 False
     ):
-        """
-        初始化TensorOffloadManager。
-        
-        Args:
-            enabled: 是否启用offload
-            offload_optimizer_states: 是否也offload优化器状态
-            pin_memory: 是否使用pinned memory加速传输
-            num_prefetch_layers: 提前预取几层的参数（用于隐藏延迟）
-            release_after_fwd: 若为True，则在FWD后立刻D2H回写，BWD前再JIT预取（峰值显存最低）
-            bucket_mb: 预留分桶大小（MB），用于后续分桶实现
-        """
         self.enabled = enabled
         self.offload_optimizer_states = offload_optimizer_states
         self.pin_memory = pin_memory
-        self.num_prefetch_layers = num_prefetch_layers
-        self.release_after_fwd = release_after_fwd
+        self.num_prefetch_layers = max(0, int(num_prefetch_layers))
+        self.release_after_fwd = bool(release_after_fwd)
         self.bucket_mb = bucket_mb
+        self.pp_mode = pp_mode
+        self.copy_chunk_bytes = max(1, int(copy_chunk_mb)) * 1024 * 1024
+        self.include_buffers = include_buffers
+        self.offload_gradients = offload_gradients
+        self.aggressive_release = aggressive_release
         
-        # 存储层和其参数的映射
+        # 重计算相关配置
+        self.recompute_enabled = recompute_enabled and (_ckpt is not None)
+        self.recompute_policy = recompute_policy
+        self.recompute_min_params_bytes = int(recompute_min_params_mb * 1024 * 1024)
+        self.recompute_use_reentrant = recompute_use_reentrant
+        if recompute_enabled and _ckpt is None:
+            logger.warning("torch.utils.checkpoint 不可用，已禁用重计算。")
+
+        # PP 下强制关闭 FWD 后立刻 offload（1F1B/交错 1F1B 窗口极短）
+        if self.pp_mode and self.release_after_fwd:
+            logger.warning("Pipeline 模式下不建议 FWD 后立刻 offload —— 已自动禁用。")
+            self.release_after_fwd = False
+
+        # 层 -> 参数
         self.layer_params: Dict[int, List[torch.nn.Parameter]] = OrderedDict()
-        self.layer_param_devices: Dict[int, List[str]] = {}  # 跟踪参数当前位置
-        
-        # 两条独立 stream：H2D 预取、D2H 回写
+        # （可选）层 -> 持久 buffer（如 BN 的运行均值/方差）
+        self.layer_buffers: Dict[int, List[torch.Tensor]] = OrderedDict()
+        # 跟踪每个 param 当前落在 'cuda' 还是 'cpu'
+        self.layer_param_devices: Dict[int, List[str]] = {}
+        # 跟踪每个梯度当前落在 'cuda' 还是 'cpu'
+        self.layer_grad_devices: Dict[int, List[str]] = {}
+        # 目标设备（用于确保在正确 device 上分配）
+        self.layer_target_device: Dict[int, torch.device] = {}
+        # 每层参数规模（用于 auto 重计算策略）
+        self.layer_param_bytes: Dict[int, int] = {}
+
+        # 共享参数去重映射（param_id -> 主属层）
+        self.param_owner: Dict[int, int] = {}
+
+        # 独立 H2D / D2H stream（单设备场景足够；多设备时目标 device guard）
         self.h2d_stream = torch.cuda.Stream() if enabled else None
         self.d2h_stream = torch.cuda.Stream() if enabled else None
-        
-        # 每层一个 H2D 完成事件
-        self.layer_ready_events: Dict[int, torch.cuda.Event] = {}
-        
-        # 每层 D2H 完成事件（供后续 H2D 等待）
-        self.layer_d2h_done_events: Dict[int, torch.cuda.Event] = {}
-        
-        # 记录每层"FWD 后是否已释放"，用于 BWD 前是否要再取回
+
+        # 事件池（复用事件对象减少分配）
+        self._event_pool: List[torch.cuda.Event] = []
+        self.layer_ready_events: Dict[int, torch.cuda.Event] = {}      # H2D 完成
+        self.layer_d2h_done_events: Dict[int, torch.cuda.Event] = {}   # D2H 完成
+
+        # 记录"FWD 后是否释放过"
         self.layer_released_after_fwd: Dict[int, bool] = {}
-        
-        # H2D 源张量生命周期保护：暂存 CPU 张量引用，直到 H2D 完成
+
+        # 保护 H2D 源 CPU 张量生命周期
         self._pending_h2d_src: Dict[int, List[torch.Tensor]] = {}
-        
-        # 每层注册时的目标 device（避免用 current_device 误判）
-        self.layer_target_device: Dict[int, torch.device] = {}
-        
-        # 统计信息
+
+        # CPU pinned memory 缓存池（减少反复分配）
+        self._cpu_tensor_cache: Dict[Tuple[torch.Size, torch.dtype], List[torch.Tensor]] = {}
+        self._max_cache_size = 100  # 最多缓存100个张量
+
+        # 统计
         self.stats = {
             'total_offloaded_bytes': 0,
             'total_prefetched_bytes': 0,
             'num_offload_ops': 0,
             'num_prefetch_ops': 0,
+            'total_grad_offloaded_bytes': 0,
+            'num_cache_hits': 0,
         }
-        
-        # 当前正在使用的层
-        self.current_layer_id: Optional[int] = None
-        
-        # 跟踪已注册的层，用于初始offload
+
+        # 优化器（可选）
+        self._optimizer = None
+
+        # 初始 offload 标记
         self.initial_offload_done = False
-        
-        # 用于跟踪每层的 saved_tensors_hooks 上下文
-        self._layer_saved_ctx: Dict[int, object] = {}
-        
-        logger.info(f"TensorOffloadManager initialized: enabled={enabled}, "
-                   f"pin_memory={pin_memory}, num_prefetch_layers={num_prefetch_layers}, "
-                   f"release_after_fwd={release_after_fwd}, bucket_mb={bucket_mb}")
-    
+
+        logger.info(
+            f"TensorOffloadManager initialized: enabled={enabled}, pin_memory={pin_memory}, "
+            f"num_prefetch_layers={self.num_prefetch_layers}, pp_mode={pp_mode}, "
+            f"release_after_fwd={self.release_after_fwd}, copy_chunk_mb={copy_chunk_mb}, "
+            f"offload_optimizer_states={offload_optimizer_states}, offload_gradients={offload_gradients}, "
+            f"aggressive_release={aggressive_release}, "
+            f"recompute_enabled={self.recompute_enabled}, recompute_policy={self.recompute_policy}, "
+            f"recompute_min_params_mb={recompute_min_params_mb}, recompute_use_reentrant={self.recompute_use_reentrant}"
+        )
+
+    # [NEW] attach 优化器用于教学用 offload states
+    def attach_optimizer(self, optimizer: torch.optim.Optimizer):
+        self._optimizer = optimizer
+        if self.offload_optimizer_states:
+            logger.info("Optimizer attached. Will offload optimizer states to CPU (experimental).")
+
     def register_layer(self, layer_id: int, module: nn.Module):
-        """
-        注册一个需要管理的层。
-        
-        Args:
-            layer_id: 层的唯一标识符（通常是层号）
-            module: 要管理的模块
-        """
+        """注册层以进行 offload 管理。"""
         if not self.enabled:
             return
-        
-        # 收集该层的所有参数
+
         params = [p for p in module.parameters() if p.requires_grad]
-        
-        self.layer_params[layer_id] = params
-        
-        # 记录该层的目标设备（应该是GPU设备，即使参数当前在CPU上）
-        # 对于tensor offload场景，参数最终要在GPU上计算，所以target应该是CUDA
-        # 检查参数当前是否在GPU上，如果是则使用该设备；否则使用当前CUDA设备
-        first_cuda_param_device = next((p.device for p in params if p.is_cuda), None)
-        if first_cuda_param_device is not None:
-            dev = first_cuda_param_device
+        if self.include_buffers:
+            bufs = [b for b in module.buffers() if getattr(b, 'persistent', True)]
         else:
-            # 所有参数都在CPU上，使用当前的CUDA设备作为目标
-            dev = torch.device('cuda', torch.cuda.current_device())
+            bufs = []
+
+        # 记录 owner，避免共享参数重复搬运
+        for p in params:
+            pid = id(p)
+            if pid not in self.param_owner:
+                self.param_owner[pid] = layer_id
+
+        self.layer_params[layer_id] = params
+        self.layer_buffers[layer_id] = bufs
+
+        # 确定目标设备
+        first_cuda_param_device = next((p.device for p in params if p.is_cuda), None)
+        dev = first_cuda_param_device if first_cuda_param_device is not None \
+              else torch.device('cuda', torch.cuda.current_device())
         self.layer_target_device[layer_id] = dev
-        
+
         self.layer_param_devices[layer_id] = ['cuda' if p.is_cuda else 'cpu' for p in params]
+        self.layer_grad_devices[layer_id] = ['none' for _ in params]  # 初始化梯度状态
         self.layer_released_after_fwd[layer_id] = False
-        
-        total_size = sum(p.numel() * p.element_size() for p in params)
-        actual_device = next((p.device for p in params), dev)
-        logger.info(f"Registered layer {layer_id} (current: {actual_device}, target: {dev}) with {len(params)} params "
-                   f"({total_size / 1024**2:.2f} MB)")
-    
+
+        total_size = sum(p.numel() * p.element_size() for p in params) if params else 0
+        self.layer_param_bytes[layer_id] = int(total_size)
+        logger.info(
+            f"Registered layer {layer_id} (target: {dev}) with {len(params)} params "
+            f"({total_size / 1024**2:.2f} MB) + {len(bufs)} buffers"
+        )
+
     def initial_offload_all_layers(self):
         """
-        初始化时将所有已注册的层offload到CPU。
-        这应该在模型初始化完成后、训练开始前调用。
+        仅在：
+          1) 模型构建/优化器状态初始化完成后；
+          2) 首次迭代之前；
+        调用一次。将参数统一落到 CPU，配合 JIT 预取启动训练。
+        性能优化：使用异步操作，最后统一同步。
         """
         if not self.enabled or self.initial_offload_done:
             return
-        
-        logger.info("Performing initial offload of all layers to CPU...")
-        total_offloaded = 0
+        logger.info("Initial offload all registered layers to CPU...")
+        # 性能优化：使用异步操作，批量 offload
         for layer_id in self.layer_params.keys():
-            # 同步 D2H，保证真的落回 CPU
-            self.offload_layer(layer_id, async_op=False, empty_cache=False)
-            # 标记该层"已释放"，后续首次需要会 JIT 取回
+            self.offload_layer(layer_id, async_op=True, empty_cache=False)
             self.layer_released_after_fwd[layer_id] = True
-            total_offloaded += sum(
-                p.numel() * p.element_size() 
-                for p in self.layer_params[layer_id]
-            )
-        # 最后统一清空缓存
-        if total_offloaded > 0:
-            torch.cuda.empty_cache()
-            logger.info(f"Initial offload completed: {total_offloaded / 1024**2:.2f} MB offloaded to CPU")
-        
+        # 等待所有异步操作完成
+        if self.d2h_stream is not None:
+            self.d2h_stream.synchronize()
+        torch.cuda.empty_cache()
         self.initial_offload_done = True
+        logger.info("Initial offload completed.")
+
+    # --------------------- 内部工具 --------------------- #
+    def _get_event(self) -> torch.cuda.Event:
+        """从事件池获取或创建新事件。"""
+        if self._event_pool:
+            return self._event_pool.pop()
+        return torch.cuda.Event()
     
-    def offload_layer(self, layer_id: int, async_op: bool = True, empty_cache: bool = False):
-        """
-        将指定层的参数offload到CPU。
+    def _release_event(self, event: torch.cuda.Event):
+        """将事件归还到事件池。"""
+        if len(self._event_pool) < 50:  # 限制事件池大小
+            self._event_pool.append(event)
+    
+    def _get_cpu_tensor(self, size: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+        """从缓存池获取或创建 CPU pinned tensor。"""
+        if not self.pin_memory:
+            return torch.empty(size, dtype=dtype, device='cpu')
         
-        注意：同时处理 model_param 和 main_param（用于混合精度优化器）
+        key = (size, dtype)
+        cache_list = self._cpu_tensor_cache.get(key, [])
         
-        Args:
-            layer_id: 要offload的层ID
-            async_op: 是否使用异步操作
-            empty_cache: 是否在offload后清空GPU缓存（用于真正释放内存）
-        """
-        if not self.enabled or layer_id not in self.layer_params:
+        if cache_list:
+            self.stats['num_cache_hits'] += 1
+            return cache_list.pop()
+        
+        return torch.empty(size, dtype=dtype, device='cpu', pin_memory=True)
+    
+    def _release_cpu_tensor(self, tensor: torch.Tensor):
+        """将 CPU tensor 归还到缓存池。"""
+        if not self.pin_memory or not tensor.is_pinned():
             return
         
-        # 清理已完成的 H2D 源张量引用
-        self._cleanup_completed_h2d_sources()
+        key = (tensor.size(), tensor.dtype)
+        cache_list = self._cpu_tensor_cache.setdefault(key, [])
         
+        # 限制每个 key 的缓存数量
+        if len(cache_list) < 10:
+            cache_list.append(tensor)
+    
+    def _clear_tensor_cache(self):
+        """清空张量缓存池，释放内存。"""
+        total_cleared = sum(len(v) for v in self._cpu_tensor_cache.values())
+        self._cpu_tensor_cache.clear()
+        if total_cleared > 0:
+            logger.debug(f"Cleared {total_cleared} cached CPU tensors")
+    
+    def _chunked_copy(self, dst: torch.Tensor, src: torch.Tensor, stream: Optional[torch.cuda.Stream], async_op: bool):
+        """按 MB 分块拷贝，降低长拷贝对流的占用。性能优化：避免重复创建 stream context。"""
+        if dst.numel() == 0:
+            return
+        view_dst = dst.view(-1)
+        view_src = src.view(-1)
+        elem = src.element_size()
+        chunk_elems = max(1, self.copy_chunk_bytes // elem)
+        n = view_dst.numel()
+        
+        # 性能优化：将 stream context 提升到循环外
+        if async_op and stream is not None:
+            with torch.cuda.stream(stream):
+                off = 0
+                while off < n:
+                    end = min(off + chunk_elems, n)
+                    view_dst[off:end].copy_(view_src[off:end], non_blocking=True)
+                    off = end
+        else:
+            off = 0
+            while off < n:
+                end = min(off + chunk_elems, n)
+                view_dst[off:end].copy_(view_src[off:end])
+                off = end
+
+    def _cleanup_completed_h2d_sources(self):
+        """清理已完成的 H2D 源张量。性能优化：减少不必要的遍历。"""
+        if not self.enabled or not self._pending_h2d_src:
+            return
+        layers_to_remove = []
+        for lid in list(self.layer_ready_events.keys()):
+            evt = self.layer_ready_events.get(lid)
+            if evt and lid in self._pending_h2d_src and evt.query():
+                layers_to_remove.append(lid)
+        for lid in layers_to_remove:
+            self._pending_h2d_src.pop(lid, None)
+            # 归还事件到事件池
+            evt = self.layer_ready_events.pop(lid, None)
+            if evt:
+                self._release_event(evt)
+
+    # --------------------- D2H & H2D 核心 --------------------- #
+    def offload_layer(self, layer_id: int, async_op: bool = True, empty_cache: bool = False):
+        """将层参数从 GPU offload 到 CPU。性能优化：使用缓存池，减少内存分配。"""
+        if not self.enabled or layer_id not in self.layer_params:
+            return
+
         params = self.layer_params[layer_id]
+        if not params:  # 空参数列表保护
+            return
+            
         devices = self.layer_param_devices[layer_id]
-        
+
         total_bytes = 0
-        stream = self.d2h_stream if (async_op and self.d2h_stream is not None) else torch.cuda.current_stream()
+        # 让 d2h_stream 等待 default/compute 流位置（确保 optimizer.step() 已写完）
+        stream = self.d2h_stream if (async_op and self.d2h_stream is not None) else None
+        use_async = async_op and stream is not None
         
-        # ========== CRITICAL FIX: Stream Synchronization ==========
-        # 在异步offload之前，必须确保default stream上的所有操作都已完成
-        # 特别是optimizer.step()中的参数更新操作
-        # 否则可能会拷贝到未更新的参数值，导致下一次迭代使用错误的参数
-        if async_op and self.d2h_stream is not None:
-            # 创建一个event来标记default stream的当前位置
-            sync_event = torch.cuda.Event()
+        if use_async:
+            sync_event = self._get_event()
             sync_event.record(torch.cuda.current_stream())
-            # 让d2h_stream等待这个event，确保之前的所有操作都已完成
-            self.d2h_stream.wait_event(sync_event)
-        # ==========================================================
-        
+            stream.wait_event(sync_event)
+            self._release_event(sync_event)
+
         with torch.no_grad():
             for i, (param, devflag) in enumerate(zip(params, devices)):
-                if devflag == 'cuda':  # 只offload在GPU上的参数
+                # 共享参数：只由 owner 层负责搬运，其他层跳过
+                if self.param_owner.get(id(param), layer_id) != layer_id:
+                    continue
+                if devflag == 'cuda':
                     src = param.data  # GPU tensor
-                    
-                    # 用 pinned CPU tensor 做落地
-                    cpu_tensor = torch.empty(
-                        param.size(), 
-                        dtype=param.dtype, 
-                        device='cpu',
-                        pin_memory=self.pin_memory
-                    )
-                    
-                    if async_op and self.d2h_stream is not None:
-                        with torch.cuda.stream(stream):
-                            cpu_tensor.copy_(src, non_blocking=True)
-                        #  关键：保护源 GPU 张量生命周期，防止 D2H 未完成时被回收
-                        src.record_stream(self.d2h_stream)
-                    else:
-                        cpu_tensor.copy_(src)
-                    
-                    # 重新绑定 data（no_grad 保护，避免构图污染）
+                    # 使用缓存池获取 CPU tensor
+                    cpu_tensor = self._get_cpu_tensor(param.size(), param.dtype)
+                    self._chunked_copy(cpu_tensor, src, stream, use_async)
+                    # 错误修复：record_stream 应该在赋值前调用
+                    if use_async:
+                        src.record_stream(stream)
                     param.data = cpu_tensor
-                    
-                    # 显式删除旧的 GPU 张量引用，利于 GC
                     del src
-                    
-                    # === 关键：同步处理 main_param（混合精度优化器） ===
-                    # 如果参数有 main_param 属性（fp32 副本），也需要 offload
-                    if hasattr(param, 'main_param') and param.main_param is not None:
-                        if param.main_param.is_cuda:
-                            main_src = param.main_param.data
-                            main_cpu_tensor = torch.empty(
-                                param.main_param.size(),
-                                dtype=param.main_param.dtype,
-                                device='cpu',
-                                pin_memory=self.pin_memory
-                            )
-                            if async_op and self.d2h_stream is not None:
-                                with torch.cuda.stream(stream):
-                                    main_cpu_tensor.copy_(main_src, non_blocking=True)
-                                #  保护 main_param 源 GPU 张量生命周期
-                                main_src.record_stream(self.d2h_stream)
-                            else:
-                                main_cpu_tensor.copy_(main_src)
-                            
-                            param.main_param.data = main_cpu_tensor
-                            del main_src
-                            total_bytes += param.main_param.numel() * param.main_param.element_size()
-                    # ===================================================
-                    
-                    # 更新设备状态
                     devices[i] = 'cpu'
-                    
                     total_bytes += param.numel() * param.element_size()
-        
-        # 关键：记录该层 D2H 完成事件（在 d2h_stream 上）
-        if async_op and self.d2h_stream is not None and total_bytes > 0:
-            d2h_evt = torch.cuda.Event()
-            d2h_evt.record(self.d2h_stream)
+
+                    # main_param（若存在）
+                    if hasattr(param, 'main_param') and param.main_param is not None and param.main_param.is_cuda:
+                        main_src = param.main_param.data
+                        main_cpu = self._get_cpu_tensor(param.main_param.size(), param.main_param.dtype)
+                        self._chunked_copy(main_cpu, main_src, stream, use_async)
+                        if use_async:
+                            main_src.record_stream(stream)
+                        param.main_param.data = main_cpu
+                        del main_src
+                        total_bytes += param.main_param.numel() * param.main_param.element_size()
+
+        if use_async and total_bytes > 0:
+            # 归还旧事件到池中
+            old_evt = self.layer_d2h_done_events.get(layer_id)
+            if old_evt:
+                self._release_event(old_evt)
+            # 获取新事件
+            d2h_evt = self._get_event()
+            d2h_evt.record(stream)
             self.layer_d2h_done_events[layer_id] = d2h_evt
-        
-        # 注意：不做全局同步；是否 empty_cache 交给外层定期处理
-        if empty_cache and total_bytes > 0:
+
+        if (empty_cache or self.aggressive_release) and total_bytes > 0:
             torch.cuda.empty_cache()
-        
+
         self.stats['total_offloaded_bytes'] += total_bytes
         self.stats['num_offload_ops'] += 1
-        
-    
+
     def prefetch_layer(self, layer_id: int, async_op: bool = True):
-        """
-        将指定层的参数预取到GPU。
-        
-        注意：同时处理 model_param 和 main_param（用于混合精度优化器）
-        
-        Args:
-            layer_id: 要预取的层ID
-            async_op: 是否使用异步操作
-        """
+        """预取层参数从 CPU 到 GPU。性能优化：使用事件池，及时释放旧 CPU 张量。"""
         if not self.enabled or layer_id not in self.layer_params:
             return
-        
-        # 清理已完成的 H2D 源张量引用
-        self._cleanup_completed_h2d_sources()
-        
+
         params = self.layer_params[layer_id]
+        if not params:  # 空参数列表保护
+            return
+            
         devices = self.layer_param_devices[layer_id]
         tgt = self.layer_target_device[layer_id]
-        
-        # DEBUG: 添加日志
-        import torch.distributed as dist
-        if dist.is_initialized():
-            rank = dist.get_rank()
-            logger.debug(f"[Rank {rank}] prefetch_layer {layer_id} start")
-        
-        #  如果这一层存在未完成的 D2H，必须在 H2D 前等待它
-        pending_d2h = self.layer_d2h_done_events.get(layer_id, None)
-        if pending_d2h is not None:
+
+        # 若有未完成 D2H，H2D 需等待
+        pending = self.layer_d2h_done_events.get(layer_id, None)
+        if pending is not None:
             if async_op and self.h2d_stream is not None:
-                self.h2d_stream.wait_event(pending_d2h)
+                self.h2d_stream.wait_event(pending)
             else:
-                # 同步路径：确保 d2h_stream 已经结束
                 if self.d2h_stream is not None:
                     self.d2h_stream.synchronize()
-            # 一旦我们保证了 D2H 完成，就可以清理这个事件
-            self.layer_d2h_done_events.pop(layer_id, None)
-        
+            # 归还事件到池
+            self._release_event(self.layer_d2h_done_events.pop(layer_id))
+
         total_bytes = 0
-        if async_op and self.h2d_stream is not None:
-            stream = self.h2d_stream
-        else:
-            stream = torch.cuda.current_stream()
-        
-        # H2D 源张量（CPU）生命周期保护：暂存强引用列表
-        cpu_src_refs = []
-        
-        with torch.no_grad():
+        stream = self.h2d_stream if (async_op and self.h2d_stream is not None) else None
+        use_async = async_op and stream is not None
+        cpu_src_refs: List[torch.Tensor] = []
+        old_cpu_tensors: List[torch.Tensor] = []
+
+        with torch.no_grad(), torch.cuda.device(tgt):
             for i, (param, devflag) in enumerate(zip(params, devices)):
-                if devflag == 'cpu':  # 只预取在CPU上的参数
-                    # 用与参数同 dtype，在该层目标 device 上建空张量
+                if self.param_owner.get(id(param), layer_id) != layer_id:
+                    continue
+                if devflag == 'cpu':
+                    old_cpu = param.data
+                    old_cpu_tensors.append(old_cpu)
+                    
                     gpu_tensor = torch.empty(param.size(), dtype=param.dtype, device=tgt)
-                    
-                    # 关键：暂存 CPU 源张量引用，防止 H2D 未完成时被释放
                     cpu_src = param.data
-                    if async_op and self.h2d_stream is not None:
+                    if use_async:
                         cpu_src_refs.append(cpu_src)
-                    
-                    # 从 CPU (最好是 pinned) 拷贝到 GPU
-                    if async_op and self.h2d_stream is not None:
-                        with torch.cuda.stream(stream):
-                            gpu_tensor.copy_(cpu_src, non_blocking=True)
-                    else:
-                        gpu_tensor.copy_(cpu_src)
-                    
-                    # 重新绑定 storage（注意：在 no_grad 内）
+                    self._chunked_copy(gpu_tensor, cpu_src, stream, use_async)
                     param.data = gpu_tensor
-                    
-                    # === 关键：同步处理 main_param（混合精度优化器） ===
-                    # 如果参数有 main_param 属性（fp32 副本），也需要预取
-                    if hasattr(param, 'main_param') and param.main_param is not None:
-                        if not param.main_param.is_cuda:
-                            main_gpu_tensor = torch.empty(
-                                param.main_param.size(),
-                                dtype=param.main_param.dtype,
-                                device=tgt
-                            )
-                            # ★ 暂存 main_param 的 CPU 源张量引用
-                            main_cpu_src = param.main_param.data
-                            if async_op and self.h2d_stream is not None:
-                                cpu_src_refs.append(main_cpu_src)
-                                with torch.cuda.stream(stream):
-                                    main_gpu_tensor.copy_(main_cpu_src, non_blocking=True)
-                            else:
-                                main_gpu_tensor.copy_(main_cpu_src)
-                            
-                            param.main_param.data = main_gpu_tensor
-                            total_bytes += param.main_param.numel() * param.main_param.element_size()
-                    # ===================================================
-                    
-                    # 更新设备状态
                     devices[i] = 'cuda'
-                    
                     total_bytes += param.numel() * param.element_size()
-        
-        # H2D 完成后在该层记录事件，供 compute stream 精确等待
-        # 只有当实际有数据传输时才记录事件
-        if async_op and self.h2d_stream is not None and total_bytes > 0:
-            evt = torch.cuda.Event()
-            evt.record(self.h2d_stream)
+
+                    if hasattr(param, 'main_param') and param.main_param is not None and (not param.main_param.is_cuda):
+                        old_main_cpu = param.main_param.data
+                        old_cpu_tensors.append(old_main_cpu)
+                        
+                        main_gpu = torch.empty_like(param.main_param, device=tgt)
+                        main_cpu_src = param.main_param.data
+                        if use_async:
+                            cpu_src_refs.append(main_cpu_src)
+                        self._chunked_copy(main_gpu, main_cpu_src, stream, use_async)
+                        param.main_param.data = main_gpu
+                        total_bytes += param.main_param.numel() * param.main_param.element_size()
+
+        if use_async and total_bytes > 0:
+            # 归还旧事件到池
+            old_evt = self.layer_ready_events.get(layer_id)
+            if old_evt:
+                self._release_event(old_evt)
+            # 获取新事件
+            evt = self._get_event()
+            evt.record(stream)
             self.layer_ready_events[layer_id] = evt
-            
-            #  保存 CPU 源张量引用，防止 H2D 未完成时被释放
             if cpu_src_refs:
                 self._pending_h2d_src[layer_id] = cpu_src_refs
-        
+
+        # 将旧的 CPU 张量归还到缓存池（如果不再需要）
+        if not use_async:
+            for old_cpu in old_cpu_tensors:
+                self._release_cpu_tensor(old_cpu)
+
         self.stats['total_prefetched_bytes'] += total_bytes
         self.stats['num_prefetch_ops'] += 1
-        
-        logger.debug(f"Prefetched layer {layer_id}: {total_bytes / 1024**2:.2f} MB")
-    
-    def prefetch_next_layers(self, current_layer_id: int):
-        """
-        预取接下来几层的参数（用于隐藏传输延迟）。
-        
-        Args:
-            current_layer_id: 当前层ID
-        """
-        if not self.enabled:
+
+    # --------------------- 梯度管理 --------------------- #
+    def offload_layer_gradients(self, layer_id: int, async_op: bool = True):
+        """将层梯度从 GPU offload 到 CPU。"""
+        if not self.enabled or not self.offload_gradients:
             return
+        if layer_id not in self.layer_params:
+            return
+
+        params = self.layer_params[layer_id]
+        if not params:
+            return
+            
+        grad_devices = self.layer_grad_devices[layer_id]
+        stream = self.d2h_stream if (async_op and self.d2h_stream is not None) else None
+        use_async = async_op and stream is not None
         
-        # 预取接下来的num_prefetch_layers层
+        if use_async:
+            sync_event = self._get_event()
+            sync_event.record(torch.cuda.current_stream())
+            stream.wait_event(sync_event)
+            self._release_event(sync_event)
+
+        total_bytes = 0
+        with torch.no_grad():
+            for i, param in enumerate(params):
+                if self.param_owner.get(id(param), layer_id) != layer_id:
+                    continue
+                if param.grad is not None and param.grad.is_cuda:
+                    grad_src = param.grad.data
+                    cpu_grad = self._get_cpu_tensor(param.grad.size(), param.grad.dtype)
+                    self._chunked_copy(cpu_grad, grad_src, stream, use_async)
+                    if use_async:
+                        grad_src.record_stream(stream)
+                    param.grad.data = cpu_grad
+                    grad_devices[i] = 'cpu'
+                    total_bytes += param.grad.numel() * param.grad.element_size()
+                    # 立即释放GPU梯度内存
+                    del grad_src
+        
+        if self.aggressive_release and total_bytes > 0:
+            torch.cuda.empty_cache()
+        
+        self.stats['total_grad_offloaded_bytes'] += total_bytes
+    
+    def prefetch_layer_gradients(self, layer_id: int, async_op: bool = True):
+        """预取层梯度从 CPU 到 GPU（用于 optimizer step）。"""
+        if not self.enabled or not self.offload_gradients:
+            return
+        if layer_id not in self.layer_params:
+            return
+
+        params = self.layer_params[layer_id]
+        if not params:
+            return
+            
+        grad_devices = self.layer_grad_devices[layer_id]
+        tgt = self.layer_target_device[layer_id]
+        stream = self.h2d_stream if (async_op and self.h2d_stream is not None) else None
+        use_async = async_op and stream is not None
+
+        with torch.no_grad(), torch.cuda.device(tgt):
+            for i, param in enumerate(params):
+                if self.param_owner.get(id(param), layer_id) != layer_id:
+                    continue
+                if grad_devices[i] == 'cpu' and param.grad is not None and not param.grad.is_cuda:
+                    old_cpu_grad = param.grad.data
+                    gpu_grad = torch.empty(param.grad.size(), dtype=param.grad.dtype, device=tgt)
+                    self._chunked_copy(gpu_grad, param.grad.data, stream, use_async)
+                    param.grad.data = gpu_grad
+                    grad_devices[i] = 'cuda'
+                    # 归还旧的CPU梯度到缓存池
+                    if not use_async:
+                        self._release_cpu_tensor(old_cpu_grad)
+
+    # --------------------- 预取编排 --------------------- #
+    def prefetch_next_layers(self, current_layer_id: int):
+        """预取后续层。性能优化：避免重复转换，只预取需要的层。"""
+        if not self.enabled or self.num_prefetch_layers <= 0:
+            return
         layer_ids = list(self.layer_params.keys())
         try:
-            current_idx = layer_ids.index(current_layer_id)
+            cur = layer_ids.index(current_layer_id)
             for i in range(1, self.num_prefetch_layers + 1):
-                next_idx = current_idx + i
-                if next_idx < len(layer_ids):
-                    next_layer_id = layer_ids[next_idx]
-                    self.prefetch_layer(next_layer_id, async_op=True)
+                nxt = cur + i
+                if nxt < len(layer_ids):
+                    next_layer_id = layer_ids[nxt]
+                    # 性能优化：如果已经在 GPU，跳过预取
+                    devices = self.layer_param_devices[next_layer_id]
+                    if not all(flag == 'cuda' for flag in devices):
+                        self.prefetch_layer(next_layer_id, async_op=True)
         except ValueError:
             pass
-    
-    def _cleanup_completed_h2d_sources(self):
-        """
-        清理已完成 H2D 的 CPU 源张量引用。
-        通过查询事件状态，释放不再需要的引用。
-        """
-        if not self.enabled:
-            return
-        
-        layers_to_remove = []
-        for layer_id, evt in self.layer_ready_events.items():
-            # 如果 H2D 事件已完成，可以安全释放 CPU 源张量引用
-            if evt.query():
-                layers_to_remove.append(layer_id)
-        
-        for layer_id in layers_to_remove:
-            self._pending_h2d_src.pop(layer_id, None)
-    
+
     def ensure_on_device(self, layer_id: int):
-        """
-        确保该层参数已在 GPU。若在 CPU，则异步预取并在当前计算流等待事件。
-        无论是正向、反向还是重算，这个入口都安全可重入。
-        """
+        """确保层参数在 GPU 上。性能优化：快速路径判断。"""
         if not self.enabled or layer_id not in self.layer_params:
             return
-        
-        # 清理已完成的 H2D 源张量引用
-        self._cleanup_completed_h2d_sources()
-        
         devices = self.layer_param_devices[layer_id]
-        # 快速路径：都在 cuda
+        # 快速路径：如果已经全部在 GPU，直接返回
         if all(flag == 'cuda' for flag in devices):
             return
-        
-        # 触发异步预取
         self.prefetch_layer(layer_id, async_op=True)
         evt = self.layer_ready_events.get(layer_id, None)
         if evt is not None:
-            # 在当前（很关键：autograd/重算所在）计算流上等待
             torch.cuda.current_stream().wait_event(evt)
-    
-    def _saved_tensors_pack(self, t: torch.Tensor):
-        """保存张量时的 pack hook，我们不动保存的张量，直接原样返回，避免引入额外拷贝/同步。"""
+
+    # --------------------- saved_tensors hooks --------------------- #
+    def _saved_pack(self, t: torch.Tensor):
+        """保存张量的打包函数（当前直接返回）。"""
         return t
-    
+
     def _enter_saved_hooks(self, layer_id: int):
-        """
-        在该层 forward 入口处进入 saved_tensors_hooks 作用域。
-        只要这个作用域还在，凡是在该层 forward 里被保存到 ctx 的张量，
-        其在 backward 解包前都会先触发 _saved_tensors_unpack(layer_id)。
-        """
+        """进入 saved_tensors hooks 上下文。"""
         from torch.autograd.graph import saved_tensors_hooks
-        
         def _unpack(t: torch.Tensor):
-            # 反向真正需要这些 saved tensors 的那一刻，确保权重已在 GPU
+            # 在反向传播时确保张量在正确的设备上
             self.ensure_on_device(layer_id)
             return t
-        
-        # 用 per-layer 的上下文，前置 __enter__，并在 forward_post 再 __exit__
-        ctx = saved_tensors_hooks(self._saved_tensors_pack, _unpack)
-        token = ctx.__enter__()
-        # 记录起来，post 时 __exit__
+        ctx = saved_tensors_hooks(self._saved_pack, _unpack)
+        ctx.__enter__()
+        # 以 layer_id 存储，forward_post 再退出
+        if not hasattr(self, "_layer_saved_ctx"):
+            self._layer_saved_ctx = {}
         self._layer_saved_ctx[layer_id] = ctx
-    
+
     def _exit_saved_hooks(self, layer_id: int):
-        """离开 saved_tensors_hooks 作用域。"""
-        ctx = self._layer_saved_ctx.pop(layer_id, None)
+        """退出 saved_tensors hooks 上下文。"""
+        ctx = getattr(self, "_layer_saved_ctx", {}).pop(layer_id, None)
         if ctx is not None:
             ctx.__exit__(None, None, None)
-    
+
+    # --------------------- 重计算：策略与包装 --------------------- #
+    def _should_recompute(self, layer_id: int) -> bool:
+        """按策略决定该层是否进行重计算。"""
+        if not self.recompute_enabled:
+            return False
+        if self.recompute_policy == "always":
+            return True
+        if self.recompute_policy == "auto":
+            size = self.layer_param_bytes.get(layer_id, 0)
+            return size >= self.recompute_min_params_bytes
+        return False
+
+    def _patch_forward_with_recompute(self, module: nn.Module, layer_id: int):
+        """
+        用重计算包装该 module.forward：
+        - 初次前向：确保参数在 GPU、预取后续层；进入 saved_tensors hooks；
+                    然后用 checkpoint 执行一次 forward。
+        - 反向阶段触发的二次前向（重计算）：同样会在函数入口 ensure_on_device()，保证与 offload 协同。
+        """
+        if getattr(module, "_offload_prev_forward", None) is not None:
+            return  # 已经打过补丁
+        orig_forward = module.forward
+        self.register_layer(layer_id, module)  # 确保已注册
+
+        def _run_fwd(*a, **kw):
+            # 该函数会在"初次前向"和"重计算时的二次前向"都会被调用
+            # —— 在两种路径下都确保参数在 GPU。
+            self.ensure_on_device(layer_id)
+            # 在重计算的前向里，同样使用 saved_tensors_hooks，确保中间保存/解包时能 JIT 取回参数
+            self._enter_saved_hooks(layer_id)
+            try:
+                return orig_forward(*a, **kw)
+            finally:
+                # 这里退出 hooks：不管是初次前向还是重算前向都对称关闭
+                self._exit_saved_hooks(layer_id)
+
+        def _wrapped_forward(*args, **kwargs):
+            # 初次前向路径（只有这条路径会进入该 wrapper；重算时由 _ckpt 调回 _run_fwd）
+            if not self.enabled:
+                return orig_forward(*args, **kwargs)
+            # 初次前向：保障当前层参数在设备，并预取后续层（减少重算/下层等待）
+            self.ensure_on_device(layer_id)
+            self.prefetch_next_layers(layer_id)
+            # 是否启用该层重计算
+            use_recompute = self._should_recompute(layer_id)
+            if use_recompute and _ckpt is not None and torch.is_grad_enabled():
+                # 在 PyTorch >= 2.0，建议 use_reentrant=False；旧版本没有此参数则退化调用
+                try:
+                    out = _ckpt(_run_fwd, *args, use_reentrant=self.recompute_use_reentrant, **kwargs)
+                except TypeError:
+                    # 兼容老版本（无 use_reentrant / 无 kwargs 支持）
+                    if kwargs:
+                        # 极老版本不支持 kwargs，退化为不重计算（以稳定为先）
+                        out = _run_fwd(*args, **kwargs)
+                    else:
+                        out = _ckpt(_run_fwd, *args)
+            else:
+                out = _run_fwd(*args, **kwargs)
+            # 模拟 on_forward_post_hook 的行为（但不重复进入/退出 saved_tensors hooks）
+            if self.release_after_fwd:
+                self.offload_layer(layer_id, async_op=True, empty_cache=False)
+                self.layer_released_after_fwd[layer_id] = True
+            return out
+
+        module._offload_prev_forward = orig_forward
+        module.forward = _wrapped_forward
+
+    def _unpatch_forward(self, module: nn.Module):
+        """可用于恢复 forward（目前一般不需要调用）。"""
+        if getattr(module, "_offload_prev_forward", None) is not None:
+            module.forward = module._offload_prev_forward
+            module._offload_prev_forward = None
+
+    # --------------------- 训练阶段钩子 --------------------- #
     def synchronize(self):
-        """同步所有异步操作（仅在必要时使用，优先使用事件机制）。"""
+        """同步所有 offload streams。"""
         if self.enabled:
             if self.h2d_stream is not None:
                 self.h2d_stream.synchronize()
             if self.d2h_stream is not None:
                 self.d2h_stream.synchronize()
-    
+
     def on_forward_pre_hook(self, layer_id: int):
-        """
-        在layer forward前调用的hook。
-        
-        Args:
-            layer_id: 即将执行forward的层ID
-        """
+        """前向传播前钩子：确保参数在设备上，启动预取。"""
         if not self.enabled:
             return
-        
-        # 进入 saved_tensors_hooks 作用域（关键：覆盖 checkpoint 重算等场景）
         self._enter_saved_hooks(layer_id)
-        
-        # 若层参数在 CPU，则异步预取 + 事件
         self.ensure_on_device(layer_id)
-        
-        # 前瞻预取后续层（可隐藏下一层 H2D）
         self.prefetch_next_layers(layer_id)
-        
-        self.current_layer_id = layer_id
-    
+
     def on_forward_post_hook(self, layer_id: int):
-        """
-        在layer forward后调用的hook。
-        
-        Args:
-            layer_id: 刚完成forward的层ID
-        """
+        """前向传播后钩子：可选地 offload 参数。"""
         if not self.enabled:
             return
-        
-        # 离开 saved_tensors_hooks 作用域
         self._exit_saved_hooks(layer_id)
-        
+        # PP 默认不在 FWD 后 offload；单卡/无 PP 可打开 release_after_fwd
         if self.release_after_fwd:
-            # 立即异步 D2H，减少峰值显存
             self.offload_layer(layer_id, async_op=True, empty_cache=False)
             self.layer_released_after_fwd[layer_id] = True
-    
+
     def on_backward_pre_hook(self, layer_id: int):
-        """
-        在layer backward前调用的hook。
-        
-        Args:
-            layer_id: 即将执行backward的层ID
-        """
+        """反向传播前钩子：JIT 取回参数（如果之前被 offload）。"""
         if not self.enabled:
             return
-        
-        # 若 FWD 后曾释放，则在 BWD 前 JIT 取回
+        # 若 FWD 后释放过，则在 BWD 前 JIT 取回
         if self.layer_released_after_fwd.get(layer_id, False):
             self.prefetch_layer(layer_id, async_op=True)
             evt = self.layer_ready_events.get(layer_id, None)
             if evt is not None:
                 torch.cuda.current_stream().wait_event(evt)
             self.layer_released_after_fwd[layer_id] = False
-    
+
     def on_backward_post_hook(self, layer_id: int):
-        """
-        在layer backward后调用的hook。
-        
-        Args:
-            layer_id: 刚完成backward的层ID
-        
-        注意：
-            不在这里 offload！因为优化器的 prepare_grads() 和参数更新需要参数在 GPU。
-            应该在 optimizer.step() 完成后调用 on_optimizer_step_post() 来统一 offload。
-        """
+        """反向传播后钩子：在 PP 中不执行操作，等待统一处理。"""
         if not self.enabled:
             return
-        
-        # 不做任何操作，等待 optimizer.step() 完成后再 offload
-        # 在新的架构中，saved_tensors_hooks 的 unpack 会自动处理 BWD 前的预取
+        # 注意：不要在这里 offload 梯度！
+        # 因为反向传播链可能还没完成，过早 offload 会导致设备不匹配错误。
+        # 梯度 offload 应该在整个 backward 完成后，在 on_backward_complete() 中统一处理
         pass
     
-    def on_optimizer_step_pre(self):
-        """
-        在optimizer.step()之前调用，确保所有参数都在GPU上。
-        
-        这是关键的一步：在Pipeline Parallel中，由于调度的复杂性，
-        某些层可能在forward后被offload了，但它们的backward还没有执行
-        （或者saved_tensors_hooks的unpack还没有触发）。
-        
-        optimizer.step()需要所有参数都在GPU上进行梯度处理，
-        因此我们需要在这里确保所有参数都已预取回GPU。
-        
-        Example:
-            # 在训练循环中
-            loss.backward()
-            offload_manager.on_optimizer_step_pre()  # 确保所有参数在GPU
-            optimizer.step()
-            offload_manager.on_optimizer_step_post()  # 再次offload
-        """
-        if not self.enabled:
+    def on_backward_complete(self):
+        """整个反向传播完成后的钩子：统一 offload 所有梯度到 CPU。"""
+        if not self.enabled or not self.offload_gradients:
             return
         
-        logger.debug("Ensuring all parameters are on GPU before optimizer step...")
-        
-        # 确保所有层的参数都在GPU上
+        # 在整个 backward 完成后，统一 offload 所有层的梯度
         for layer_id in self.layer_params.keys():
-            self.ensure_on_device(layer_id)
+            self.offload_layer_gradients(layer_id, async_op=True)
         
-        # 同步H2D stream，确保所有预取都完成
-        if self.h2d_stream is not None:
-            self.h2d_stream.synchronize()
-        
-        logger.debug("All parameters ready on GPU for optimizer step")
-    
-    def on_optimizer_step_post(self):
-        """
-        在optimizer.step()完成后调用，将所有层的参数offload到CPU。
-        
-        这个方法应该在训练循环中，optimizer.step()之后、下一次forward之前调用。
-        它会将所有当前在GPU上的参数offload到CPU，为下一次迭代腾出显存。
-        
-        Example:
-            # 在训练循环中
-            loss.backward()
-            offload_manager.on_optimizer_step_pre()  # 确保所有参数在GPU
-            optimizer.step()
-            offload_manager.on_optimizer_step_post()  # 在这里统一offload
-        """
-        if not self.enabled:
-            return
-        
-        # 将所有层的参数offload到CPU
-        for layer_id in self.layer_params.keys():
-            self.offload_layer(layer_id, async_op=True, empty_cache=False)
-            self.layer_released_after_fwd[layer_id] = True
-        
-        # 可选：同步D2H stream，确保offload完成
+        # 等待 D2H 完成
         if self.d2h_stream is not None:
             self.d2h_stream.synchronize()
         
-        # 清理所有已完成的 H2D 源张量引用（optimizer step 后，所有 H2D 应该都已完成）
+        # 积极释放显存
+        if self.aggressive_release:
+            torch.cuda.empty_cache()
+
+    def on_optimizer_step_pre(self):
+        """优化器步骤前：确保所有参数和梯度在 GPU 上。"""
+        if not self.enabled:
+            return
+        
+        # 确保全部参数和梯度在 GPU（处理重算/延迟预取场景）
+        for layer_id in self.layer_params.keys():
+            self.ensure_on_device(layer_id)
+            # 预取梯度回 GPU
+            if self.offload_gradients:
+                self.prefetch_layer_gradients(layer_id, async_op=True)
+        
+        if self.h2d_stream is not None:
+            self.h2d_stream.synchronize()
+
+        # （可选）优化器状态 JIT 预取（教学用途）
+        if self.offload_optimizer_states and self._optimizer is not None:
+            stream = self.h2d_stream
+            use_async = stream is not None
+            for group in self._optimizer.param_groups:
+                for p in group['params']:
+                    if p.device.type != 'cuda':
+                        continue  # 跳过非 CUDA 参数
+                    state = self._optimizer.state.get(p, {})
+                    for k in ('exp_avg', 'exp_avg_sq'):
+                        buf = state.get(k, None)
+                        if isinstance(buf, torch.Tensor) and (not buf.is_cuda):
+                            gpu_buf = torch.empty_like(buf, device=p.device)
+                            self._chunked_copy(gpu_buf, buf, stream, use_async)
+                            state[k] = gpu_buf
+            if use_async:
+                stream.synchronize()
+
+    def on_optimizer_step_post(self):
+        """优化器步骤后：将所有参数 offload 到 CPU。性能优化：批量处理，定期清理。"""
+        if not self.enabled:
+            return
+        
+        # 统一将所有层参数 offload 到 CPU（PP 友好）
+        for layer_id in self.layer_params.keys():
+            self.offload_layer(layer_id, async_op=True, empty_cache=False)
+            self.layer_released_after_fwd[layer_id] = True
+
+        # （可选）优化器状态 offload（教学用途）
+        if self.offload_optimizer_states and self._optimizer is not None:
+            stream = self.d2h_stream
+            use_async = stream is not None
+            for group in self._optimizer.param_groups:
+                for p in group['params']:
+                    state = self._optimizer.state.get(p, {})
+                    for k in ('exp_avg', 'exp_avg_sq'):
+                        buf = state.get(k, None)
+                        if isinstance(buf, torch.Tensor) and buf.is_cuda:
+                            cpu_buf = self._get_cpu_tensor(buf.size(), buf.dtype)
+                            self._chunked_copy(cpu_buf, buf, stream, use_async)
+                            if use_async:
+                                buf.record_stream(stream)
+                            state[k] = cpu_buf
+
+        if self.d2h_stream is not None:
+            self.d2h_stream.synchronize()
+
+        # 清理已完成的 H2D 源张量
+        self._cleanup_completed_h2d_sources()
+        # 彻底清理剩余的源张量引用
         self._pending_h2d_src.clear()
         
-        # 定期清空GPU缓存以真正释放内存
-        torch.cuda.empty_cache()
+        # 定期清理张量缓存（避免缓存过大）
+        total_cached = sum(len(v) for v in self._cpu_tensor_cache.values())
+        if total_cached > self._max_cache_size:
+            self._clear_tensor_cache()
         
-        logger.debug("Offloaded all layers after optimizer step")
-    
+        # 更积极的显存释放
+        if self.aggressive_release:
+            torch.cuda.empty_cache()
+
+    # --------------------- 统计 --------------------- #
     def get_stats(self) -> Dict:
-        """获取统计信息。"""
         stats = self.stats.copy()
         stats['total_offloaded_mb'] = stats['total_offloaded_bytes'] / 1024**2
         stats['total_prefetched_mb'] = stats['total_prefetched_bytes'] / 1024**2
+        stats['total_grad_offloaded_mb'] = stats['total_grad_offloaded_bytes'] / 1024**2
+        stats['total_cached_tensors'] = sum(len(v) for v in self._cpu_tensor_cache.values())
+        stats['cache_hit_rate'] = (stats['num_cache_hits'] / max(1, stats['num_offload_ops'])) * 100
         return stats
-    
+
     def print_stats(self):
-        """打印统计信息。"""
-        stats = self.get_stats()
-        logger.info("=" * 60)
+        s = self.get_stats()
+        logger.info("=" * 70)
         logger.info("Tensor Offload Statistics:")
-        logger.info(f"  Total offloaded: {stats['total_offloaded_mb']:.2f} MB "
-                   f"({stats['num_offload_ops']} operations)")
-        logger.info(f"  Total prefetched: {stats['total_prefetched_mb']:.2f} MB "
-                   f"({stats['num_prefetch_ops']} operations)")
-        logger.info("=" * 60)
+        logger.info(f"  Params offloaded:   {s['total_offloaded_mb']:.2f} MB ({s['num_offload_ops']} ops)")
+        logger.info(f"  Params prefetched:  {s['total_prefetched_mb']:.2f} MB ({s['num_prefetch_ops']} ops)")
+        logger.info(f"  Grads offloaded:    {s['total_grad_offloaded_mb']:.2f} MB")
+        logger.info(f"  Cache hit rate:     {s['cache_hit_rate']:.1f}% ({s['num_cache_hits']} hits)")
+        logger.info(f"  Cached tensors:     {s['total_cached_tensors']}")
+        logger.info("=" * 70)
 
-
-# 全局offload manager实例
+# --------- 全局实例与挂钩工具 --------- #
 _global_offload_manager: Optional[TensorOffloadManager] = None
 
-
 def get_offload_manager() -> Optional[TensorOffloadManager]:
-    """获取全局offload manager。"""
     return _global_offload_manager
-
 
 def initialize_offload_manager(
     enabled: bool = True,
@@ -674,21 +802,16 @@ def initialize_offload_manager(
     num_prefetch_layers: int = 1,
     release_after_fwd: bool = False,
     bucket_mb: int = 0,
+    pp_mode: bool = True,
+    copy_chunk_mb: int = 64,
+    include_buffers: bool = False,
+    offload_gradients: bool = True,
+    aggressive_release: bool = True,
+    recompute_enabled: bool = True,
+    recompute_policy: str = "auto",
+    recompute_min_params_mb: float = 0.0,
+    recompute_use_reentrant: Optional[bool] = False,
 ) -> TensorOffloadManager:
-    """
-    初始化全局offload manager。
-    
-    Args:
-        enabled: 是否启用offload
-        offload_optimizer_states: 是否也offload优化器状态
-        pin_memory: 是否使用pinned memory
-        num_prefetch_layers: 预取层数
-        release_after_fwd: 若为True，则在FWD后立刻D2H回写，BWD前再JIT预取
-        bucket_mb: 预留分桶大小（MB），用于后续分桶实现
-        
-    Returns:
-        TensorOffloadManager实例
-    """
     global _global_offload_manager
     _global_offload_manager = TensorOffloadManager(
         enabled=enabled,
@@ -697,47 +820,44 @@ def initialize_offload_manager(
         num_prefetch_layers=num_prefetch_layers,
         release_after_fwd=release_after_fwd,
         bucket_mb=bucket_mb,
+        pp_mode=pp_mode,
+        copy_chunk_mb=copy_chunk_mb,
+        include_buffers=include_buffers,
+        offload_gradients=offload_gradients,
+        aggressive_release=aggressive_release,
+        recompute_enabled=recompute_enabled,
+        recompute_policy=recompute_policy,
+        recompute_min_params_mb=recompute_min_params_mb,
+        recompute_use_reentrant=recompute_use_reentrant,
     )
     return _global_offload_manager
 
-
 def attach_offload_hooks_to_layer(layer: nn.Module, layer_id: int, mgr: TensorOffloadManager):
     """
-    将offload hooks附加到指定层上。
-    
-    这个函数会：
-    1. 在manager中注册该层
-    2. 挂载forward pre/post hooks以在正确时机管理参数传输
-    
-    Args:
-        layer: 要管理的层模块
-        layer_id: 层的唯一标识符
-        mgr: TensorOffloadManager实例
-        
-    Returns:
-        Tuple of hook handles (pre_hook_handle, post_hook_handle)
-        
-    Example:
-        mgr = initialize_offload_manager(enabled=True, release_after_fwd=True)
-        handles = []
-        for lid, block in enumerate(model.transformer.layers):
-            handles += attach_offload_hooks_to_layer(block, lid, mgr)
-        mgr.initial_offload_all_layers()
+    当 mgr.recompute_enabled=True 时，采用"forward 包装 + 重计算"路径；
+    否则沿用原先的 pre/post forward hooks。
     """
-    # 注册层
+    # 始终登记层（记录设备/参数/大小等）
     mgr.register_layer(layer_id, layer)
-    
-    # 用 module hooks 在 forward 进/出时调用 manager 钩子
-    def _pre(_module, _inputs):
-        mgr.on_forward_pre_hook(layer_id)
-        return None
-    
-    def _post(_module, _inputs, _outputs):
-        mgr.on_forward_post_hook(layer_id)
-        return None
-    
-    h1 = layer.register_forward_pre_hook(_pre, with_kwargs=False)
-    h2 = layer.register_forward_hook(_post, with_kwargs=False)
-    
-    return (h1, h2)
 
+    if mgr.recompute_enabled:
+        # 重计算路径：包装 forward，不再注册 forward hooks，避免重入/重复
+        mgr._patch_forward_with_recompute(layer, layer_id)
+        # 返回一个"兼容句柄"，用于保持接口一致
+        class _DummyHandle:
+            def remove(self):  # 兼容性：不做事
+                pass
+        return (_DummyHandle(), _DummyHandle())
+    else:
+        # 旧路径：使用 hooks（不做重计算）
+        def _pre(_module, _inputs):
+            mgr.on_forward_pre_hook(layer_id)
+            return None
+
+        def _post(_module, _inputs, _outputs):
+            mgr.on_forward_post_hook(layer_id)
+            return None
+
+        h1 = layer.register_forward_pre_hook(_pre, with_kwargs=False)
+        h2 = layer.register_forward_hook(_post, with_kwargs=False)
+        return (h1, h2)

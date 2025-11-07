@@ -4,7 +4,7 @@
 #SBATCH -N 1                      # 节点数（NNODES）
 #SBATCH --ntasks-per-node=1       # 每节点任务数（保持 1 即可）
 #SBATCH --gpus-per-node=4         # 每节点 GPU 数量（GPUS_PER_NODE）
-#SBATCH -t 4:00:00               # 最长运行时间（根据需要修改）
+#SBATCH -t 1:00:00               # 最长运行时间（根据需要修改）
 #SBATCH -o /data/home/scyb226/lzx/Megatron-LM/scripts/logs/%x_%j.out         # 标准输出日志
 #SBATCH -e /data/home/scyb226/lzx/Megatron-LM/scripts/logs/%x_%j.err         # 错误日志
 
@@ -30,7 +30,7 @@ echo $LD_LIBRARY_PATH
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 #export CUDA_LAUNCH_BLOCKING=1
-#export NCCL_DEBUG=INFO                                                                                                                                        
+export NCCL_DEBUG=INFO                                                                                                                                        
                                                                           
 export NCCL_IB_DISABLE=0                                                                                                                                      
 export NCCL_IB_HCA=mlx5_0:1,mlx5_1:1,mlx5_3:1,mlx5_4:1                                                                                                        
@@ -40,6 +40,7 @@ export NCCL_IB_RETRY_CNT=13
 
 # 内存优化：减少内存碎片
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  
+
 
 TP=1  # 张量模型并行度，根据实际改
 PP=4  # pipeline并行度
@@ -54,10 +55,10 @@ HIDDEN_SIZE=4096  # Llama-2-7b 的隐藏层大小
 NUM_ATTENTION_HEADS=32  # Llama-2-7b 的注意力头数
 SEQ_LENGTH=2048
 MAX_POS_EMB=4096
-MICRO_BATCH_SIZE=1
+MICRO_BATCH_SIZE=2
 GLOBAL_BATCH_SIZE=16
-LR=0.00015
-MIN_LR=1e-5
+LR=0.00003
+MIN_LR=1e-6
 LR_DECAY_STYLE="cosine"
 WEIGHT_DECAY=0.01
 CLIP_GRAD=1.0
@@ -111,6 +112,7 @@ torchrun --nproc_per_node=${NUM_PROC} --master_port=29501 "${MEGATRON_ROOT}/pret
   --no-masked-softmax-fusion \
   --attention-softmax-in-fp32 \
   --recompute-granularity selective \
+  --init-method-std 0.006 \
   --micro-batch-size ${MICRO_BATCH_SIZE} \
   --global-batch-size ${GLOBAL_BATCH_SIZE} \
   --lr ${LR} \
@@ -127,10 +129,10 @@ torchrun --nproc_per_node=${NUM_PROC} --master_port=29501 "${MEGATRON_ROOT}/pret
   --eval-iters ${EVAL_ITERS} \
   --log-throughput \
   --log-memory-to-tensorboard \
+  --bf16 \
   --enable-tensor-offload \
-  --tensor-offload-optimizer-states \
   --tensor-offload-pin-memory \
-  --tensor-offload-num-prefetch-layers 2 \
-  --bf16
-#   --tensor-offload-release-after-fwd
+  --tensor-offload-num-prefetch-layers 3  \
+  #--tensor-offload-optimizer-states
+  #--tensor-offload-release-after-fwd
 

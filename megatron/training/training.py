@@ -1344,17 +1344,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
-    # Update parameters.
-
-    # ========== Tensor Offload: Pre-optimizer Hook ==========
-    # 在optimizer.step()之前，确保所有参数都在GPU上
-    # 这对于Pipeline Parallel非常重要，因为某些层可能在forward后offload了
-    # 但它们的backward还没有执行（或saved_tensors_hooks的unpack还没触发）
+    # ========== Tensor Offload: Backward Complete & Pre-optimizer Hooks ==========
     from megatron.core.tensor_offload import get_offload_manager
     offload_manager = get_offload_manager()
+    
+    # 在整个 backward 完成后，offload 所有梯度到 CPU 以节省显存
+    if offload_manager is not None:
+        offload_manager.on_backward_complete()
+
+    # Update parameters.
+
+    # 在optimizer.step()之前，确保所有参数和梯度都在GPU上
+    # 这对于Pipeline Parallel非常重要，因为某些层可能在forward后offload了
+    # 但它们的backward还没有执行（或saved_tensors_hooks的unpack还没触发）
     if offload_manager is not None:
         offload_manager.on_optimizer_step_pre()
-    # =========================================================
+    # ==============================================================================
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
